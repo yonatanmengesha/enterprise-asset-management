@@ -1,0 +1,89 @@
+name: Asset Management CD (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_tag:
+        description: "Successful CI tag, for example asset-build-42"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  deploy:
+    name: Deploy selected CI build
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout selected build tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.build_tag }}
+          fetch-depth: 0
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Find successful CI run for selected tag
+        id: source-run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_TAG: ${{ inputs.build_tag }}
+        run: |
+          COMMIT_SHA="$(git rev-list -n 1 "$BUILD_TAG")"
+          RUN_ID="$(gh run list             --workflow asset-management-ci.yml             --commit "$COMMIT_SHA"             --status success             --json databaseId             --jq '.[0].databaseId')"
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No successful CI run found for tag $BUILD_TAG"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifact from successful CI run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ steps.source-run.outputs.run_id }}
+          BUILD_TAG: ${{ inputs.build_tag }}
+        run: |
+          gh run download "$RUN_ID"             --name "enterprise-asset-management-$(git show -s --format=%B "$BUILD_TAG" | sed -n 's/.*build //p')"             --dir deploy-artifact || {
+              echo "Artifact name lookup failed. Check the CI run and artifact name."
+              exit 1
+            }
+          test -f deploy-artifact/enterprise-asset-management.jar
+
+      - name: Verify deployment package
+        run: |
+          ls -lh deploy-artifact/enterprise-asset-management.jar
+          sha256sum deploy-artifact/enterprise-asset-management.jar
+
+      - name: Deploy to staging server (when secrets are configured)
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          scp -i ~/.ssh/deploy_key deploy-artifact/enterprise-asset-management.jar             "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/enterprise-asset-management.jar"
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST"             "sudo systemctl restart enterprise-asset-management"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "## Manual CD"
+            echo "- **Selected tag:** ${{ inputs.build_tag }}"
+            echo "- **Source CI run:** ${{ steps.source-run.outputs.run_id }}"
+            echo "- **Deployment target:** staging"
+            echo "- **Artifact:** enterprise-asset-management.jar"
+          } >> "$GITHUB_STEP_SUMMARY"

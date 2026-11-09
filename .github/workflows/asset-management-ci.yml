@@ -1,0 +1,75 @@
+name: Asset Management CI
+
+on:
+  push:
+    branches: [ "main", "develop", "feature/**", "bugfix/**" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+permissions:
+  contents: write
+  checks: write
+
+jobs:
+  build-and-test:
+    name: Build, Test and Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Show tool versions
+        run: |
+          java --version
+          mvn --version
+
+      - name: Run unit tests and package
+        run: mvn --batch-mode --no-transfer-progress clean verify
+
+      - name: Generate CI summary
+        if: always()
+        run: |
+          {
+            echo "## Asset Management CI"
+            echo ""
+            echo "- **Branch:** $GITHUB_REF_NAME"
+            echo "- **Commit:** $GITHUB_SHA"
+            echo "- **Run:** $GITHUB_RUN_NUMBER"
+            echo "- **Java:** 21"
+            echo "- **Build:** \`mvn clean verify\`"
+            if [ -f target/surefire-reports/*.txt ]; then
+              echo ""
+              echo "### Test reports"
+              grep -hE "Tests run:|BUILD SUCCESS|BUILD FAILURE" target/surefire-reports/*.txt || true
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload executable JAR
+        uses: actions/upload-artifact@v6
+        with:
+          name: enterprise-asset-management-${{ github.run_number }}
+          path: target/enterprise-asset-management.jar
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create CI build tag on main only
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD_TAG="asset-build-${GITHUB_RUN_NUMBER}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$BUILD_TAG" "$GITHUB_SHA" -m "Successful CI build ${GITHUB_RUN_NUMBER}"
+          git push origin "$BUILD_TAG"
+          echo "- **Build tag:** \`$BUILD_TAG\`" >> "$GITHUB_STEP_SUMMARY"
